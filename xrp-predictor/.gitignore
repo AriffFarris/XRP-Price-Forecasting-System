@@ -1,0 +1,84 @@
+# -------------------------
+# Python bytecode / cache
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# -------------------------
+# Virtual environments (even if you don't use them now)
+# -------------------------
+venv/
+.env/
+.venv/
+env/
+ENV/
+.python-version
+
+# -------------------------
+# Data files (generated, not source)
+# -------------------------
+# Raw + processed data
+data/processed/
+data/raw/
+*.parquet
+*.feather
+*.h5
+*.npz
+*.npy
+*.csv
+
+# -------------------------
+# Model weights / checkpoints
+# -------------------------
+saved_models/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# -------------------------
+# Logs / experiment tracking
+# -------------------------
+logs/
+wandb/
+lightning_logs/
+events.out.tfevents.*
+
+# -------------------------
+# Jupyter / notebooks
+# -------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# -------------------------
+# IDE / editor files
+# -------------------------
+
+# VS Code
+.vscode/
+.vscode-insiders/
+
+# PyCharm / IntelliJ
+.idea/
+*.iml
+
+# Other editor cruft
+*.swp
+*.swo
+
+# -------------------------
+# OS-specific junk
+# -------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -------------------------
+# Env / secrets (if you add them later)
+# -------------------------
+*.env
+*.env.local
+.env.*
