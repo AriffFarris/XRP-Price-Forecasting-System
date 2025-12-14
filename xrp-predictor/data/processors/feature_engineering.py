@@ -11,7 +11,7 @@ DATA_DIR = Path(__file__).resolve().parents[1] / "processed"
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
     Takes a DataFrame with columns:
-      close, high, low, volume, btc_close, eth_close, ...
+    close, high, low, volume, btc_close, eth_close, ...
     and adds technical indicators + returns.
     """
     close = df["close"]
