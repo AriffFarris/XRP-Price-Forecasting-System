@@ -1,0 +1,143 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+from training.dataset import SequenceDataset
+from models.gru_model import GRUPredictor
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = ROOT / "data" / "processed"
+MODELS_DIR = ROOT / "saved_models"
+
+
+def load_checkpoint():
+    """
+    Load the trained GRU checkpoint (model weights + scaler + metadata).
+    We explicitly set weights_only=False because the checkpoint
+    includes a scikit-learn StandardScaler object.
+    """
+    ckpt_path = MODELS_DIR / "gru_xrp.pt"
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+
+    feature_cols = ckpt["feature_cols"]
+    target_col = ckpt["target_col"]
+    context_len = ckpt["context_len"]
+    scaler = ckpt["scaler"]
+
+    model = GRUPredictor(input_dim=len(feature_cols))
+    model.load_state_dict(ckpt["model_state"])
+    model.to(DEVICE)
+    model.eval()
+
+    return model, scaler, feature_cols, target_col, context_len
+
+
+def build_test_dataset(
+    timeframe: str = "1h",
+    context_len: int = 72,
+    feature_cols=None,
+    target_col: str = "log_ret_1h",
+    scaler=None,
+):
+    """
+    Recreate the same train/val/test split as in train_gru.py,
+    and return a SequenceDataset + DataLoader for the test set.
+    """
+    df = pd.read_parquet(DATA_DIR / f"xrp_features_{timeframe}.parquet")
+
+    # If feature_cols not provided, infer them like in train_gru.py
+    if feature_cols is None:
+        ignore_cols = ["ret_1h", "ret_24h", "log_ret_1h"]
+        feature_cols = [c for c in df.columns if c not in ignore_cols]
+
+    # Time-based split: 70% train, 15% val, 15% test
+    n = len(df)
+    train_end = int(n * 0.7)
+    val_end = int(n * 0.85)
+
+    df_train = df.iloc[:train_end].copy()
+    df_val = df.iloc[train_end:val_end].copy()
+    df_test = df.iloc[val_end:].copy()
+
+    # Use the same scaler as in training (fitted on train)
+    if scaler is None:
+        raise ValueError("Scaler must be provided from checkpoint.")
+
+    for d in (df_train, df_val, df_test):
+        d[feature_cols] = scaler.transform(d[feature_cols].values)
+
+    test_ds = SequenceDataset(df_test, feature_cols, target_col, context_len)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+    return test_loader, df_test.index, feature_cols
+
+
+def evaluate_gru_on_test(timeframe: str = "1h"):
+    """
+    Evaluate the GRU model on the held-out test set.
+    Prints regression metrics and directional accuracy.
+    """
+    model, scaler, feature_cols, target_col, context_len = load_checkpoint()
+    test_loader, test_index, feature_cols = build_test_dataset(
+        timeframe=timeframe,
+        context_len=context_len,
+        feature_cols=feature_cols,
+        target_col=target_col,
+        scaler=scaler,
+    )
+
+    all_preds = []
+    all_true = []
+
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+
+            preds = model(xb)
+            all_preds.append(preds.cpu().numpy())
+            all_true.append(yb.cpu().numpy())
+
+    all_preds = np.concatenate(all_preds)
+    all_true = np.concatenate(all_true)
+
+    # --- Regression metrics (on log returns) ---
+    mse = mean_squared_error(all_true, all_preds)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(all_true, all_preds)
+    r2 = r2_score(all_true, all_preds)
+
+    # --- Directional accuracy ---
+    # sign > 0 => up, sign < 0 => down, 0 => flat
+    sign_true = np.sign(all_true)
+    sign_pred = np.sign(all_preds)
+
+    # Only consider cases where true move is non-zero
+    mask = sign_true != 0
+    if mask.sum() > 0:
+        correct_dir = (sign_true[mask] == sign_pred[mask]).mean()
+    else:
+        correct_dir = np.nan
+
+    print("=== GRU Test Set Evaluation (1-step ahead log returns) ===")
+    print(f"Number of test examples: {len(all_true)}")
+    print()
+    print(f"MSE  : {mse:.8f}")
+    print(f"RMSE : {rmse:.6f}")
+    print(f"MAE  : {mae:.6f}")
+    print(f"R^2  : {r2:.4f}")
+    print()
+    if not np.isnan(correct_dir):
+        print(f"Directional accuracy (up/down, ignoring flat): {correct_dir * 100:.2f}%")
+    else:
+        print("Directional accuracy: not defined (no non-zero moves in test set)")
+
+
+if __name__ == "__main__":
+    evaluate_gru_on_test()
