@@ -41,7 +41,7 @@ def load_checkpoint():
 
 def build_test_dataset(
     timeframe: str = "1h",
-    context_len: int = 72,
+    context_len: int = 24,
     feature_cols=None,
     target_col: str = "log_ret_1h",
     scaler=None,
@@ -78,10 +78,18 @@ def build_test_dataset(
     return test_loader, df_test.index, feature_cols
 
 
+def safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Compute R², but return NaN if not well-defined (len < 2)."""
+    if len(y_true) < 2:
+        return float("nan")
+    return r2_score(y_true, y_pred)
+
+
 def evaluate_gru_on_test(timeframe: str = "1h"):
     """
     Evaluate the GRU model on the held-out test set.
-    Prints regression metrics and directional accuracy.
+    Prints regression metrics, directional accuracy,
+    and compares against simple baselines.
     """
     model, scaler, feature_cols, target_col, context_len = load_checkpoint()
     test_loader, test_index, feature_cols = build_test_dataset(
@@ -95,6 +103,7 @@ def evaluate_gru_on_test(timeframe: str = "1h"):
     all_preds = []
     all_true = []
 
+    # ---- Run model on test set ----
     with torch.no_grad():
         for xb, yb in test_loader:
             xb = xb.to(DEVICE)
@@ -104,26 +113,29 @@ def evaluate_gru_on_test(timeframe: str = "1h"):
             all_preds.append(preds.cpu().numpy())
             all_true.append(yb.cpu().numpy())
 
+    if len(all_true) == 0:
+        print("No test examples available (sequence window too long vs test set length).")
+        return
+
+    # Concatenate list of arrays into 1D arrays
     all_preds = np.concatenate(all_preds)
     all_true = np.concatenate(all_true)
 
-    # --- Regression metrics (on log returns) ---
+    # --- GRU regression metrics (on log returns) ---
     mse = mean_squared_error(all_true, all_preds)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(all_true, all_preds)
-    r2 = r2_score(all_true, all_preds)
+    r2 = safe_r2(all_true, all_preds)
 
-    # --- Directional accuracy ---
-    # sign > 0 => up, sign < 0 => down, 0 => flat
+    # --- GRU directional accuracy ---
     sign_true = np.sign(all_true)
     sign_pred = np.sign(all_preds)
+    mask = sign_true != 0  # ignore truly flat moves
 
-    # Only consider cases where true move is non-zero
-    mask = sign_true != 0
     if mask.sum() > 0:
         correct_dir = (sign_true[mask] == sign_pred[mask]).mean()
     else:
-        correct_dir = np.nan
+        correct_dir = float("nan")
 
     print("=== GRU Test Set Evaluation (1-step ahead log returns) ===")
     print(f"Number of test examples: {len(all_true)}")
@@ -131,12 +143,59 @@ def evaluate_gru_on_test(timeframe: str = "1h"):
     print(f"MSE  : {mse:.8f}")
     print(f"RMSE : {rmse:.6f}")
     print(f"MAE  : {mae:.6f}")
-    print(f"R^2  : {r2:.4f}")
+    print(f"R^2  : {r2:.4f}" if not np.isnan(r2) else "R^2  : NaN (not enough samples)")
     print()
     if not np.isnan(correct_dir):
         print(f"Directional accuracy (up/down, ignoring flat): {correct_dir * 100:.2f}%")
     else:
         print("Directional accuracy: not defined (no non-zero moves in test set)")
+
+    # ============================
+    # Baseline 1: always predict 0
+    # ============================
+    zero_preds = np.zeros_like(all_true)
+    mse_zero = mean_squared_error(all_true, zero_preds)
+    rmse_zero = np.sqrt(mse_zero)
+    mae_zero = mean_absolute_error(all_true, zero_preds)
+    r2_zero = safe_r2(all_true, zero_preds)
+
+    print("\n=== Baseline 1: Always predict 0 (no move) ===")
+    print(f"MSE  : {mse_zero:.8f}")
+    print(f"RMSE : {rmse_zero:.6f}")
+    print(f"MAE  : {mae_zero:.6f}")
+    print(f"R^2  : {r2_zero:.4f}" if not np.isnan(r2_zero) else "R^2  : NaN (not enough samples)")
+
+    # ==========================================
+    # Baseline 2: persistence (previous log-ret)
+    # ==========================================
+    prev_preds = np.zeros_like(all_true)
+    if len(all_true) > 1:
+        # For i > 0: pred[i] = true[i-1]; for i = 0: use 0
+        prev_preds[1:] = all_true[:-1]
+
+        mse_prev = mean_squared_error(all_true, prev_preds)
+        rmse_prev = np.sqrt(mse_prev)
+        mae_prev = mean_absolute_error(all_true, prev_preds)
+        r2_prev = safe_r2(all_true, prev_preds)
+
+        sign_pred_prev = np.sign(prev_preds)
+        if mask.sum() > 0:
+            correct_dir_prev = (sign_true[mask] == sign_pred_prev[mask]).mean()
+        else:
+            correct_dir_prev = float("nan")
+
+        print("\n=== Baseline 2: Predict previous log-return (persistence) ===")
+        print(f"MSE  : {mse_prev:.8f}")
+        print(f"RMSE : {rmse_prev:.6f}")
+        print(f"MAE  : {mae_prev:.6f}")
+        print(f"R^2  : {r2_prev:.4f}" if not np.isnan(r2_prev) else "R^2  : NaN (not enough samples)")
+        if not np.isnan(correct_dir_prev):
+            print(f"Directional accuracy (up/down, ignoring flat): {correct_dir_prev * 100:.2f}%")
+        else:
+            print("Directional accuracy: not defined (no non-zero moves in test set)")
+    else:
+        print("\n=== Baseline 2: Predict previous log-return (persistence) ===")
+        print("Not enough samples to compute persistence baseline.")
 
 
 if __name__ == "__main__":
