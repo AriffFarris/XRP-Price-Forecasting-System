@@ -1,5 +1,5 @@
 """
-Train LSTM Price Regressor
+Train LSTM Price Regressor (log-return regression)
 
 Predicts future PRICE by predicting future log-return:
     y = log(close[t+h] / close[t])
@@ -7,20 +7,15 @@ Predicts future PRICE by predicting future log-return:
 Then:
     pred_close[t+h] = close[t] * exp(y_hat)
 
-Why log-return?
-- more stationary than price
-- avoids needing to scale y
-- easy to convert to price for plots
-
 Usage:
-  python -m training.train_price_regressor --timeframe 1h --horizon 4 --context 48 --epochs 30
+  python -m training.train_price_regressor --timeframe 1h --horizon 4 --context 48 --epochs 30 --batch 64
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import sys
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -57,9 +52,9 @@ class PriceRegressor(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out, _ = self.lstm(x)                 # [B, T, 2H]
-        yhat = self.head(out[:, -1, :])       # [B, 1]
-        return yhat.squeeze(-1)               # [B]
+        out, _ = self.lstm(x)           # [B, T, 2H]
+        yhat = self.head(out[:, -1, :]) # [B, 1]
+        return yhat.squeeze(-1)         # [B]
 
 
 class PriceSequenceDataset(Dataset):
@@ -68,13 +63,13 @@ class PriceSequenceDataset(Dataset):
     Target y is aligned to that SAME k:
         y[k] = log(close[k+h] / close[k])
 
-    Returns: (X_seq, y, base_close, future_close)
+    Returns: (X_seq, y_logret, base_close, future_close)
     """
     def __init__(
         self,
         df_scaled: pd.DataFrame,
         df_raw: pd.DataFrame,
-        feature_cols: list[str],
+        feature_cols: List[str],
         y_col: str,
         context_len: int,
         horizon: int,
@@ -90,8 +85,6 @@ class PriceSequenceDataset(Dataset):
         self.base_close = df_raw[close_col].values.astype("float32")
         self.future_close = df_raw[close_col].shift(-horizon).values.astype("float32")
 
-        # Drop tail rows that can't form (base_close -> future_close)
-        # (y already removed most of these, but keep safe)
         valid = ~np.isnan(self.future_close)
         self.X = self.X[valid]
         self.y = self.y[valid]
@@ -117,35 +110,6 @@ class PriceSequenceDataset(Dataset):
         )
 
 
-@torch.no_grad()
-def eval_price_metrics(model: nn.Module, loader: DataLoader) -> dict:
-    model.eval()
-    abs_errs = []
-    ape = []
-    for xb, yb, base, fut in loader:
-        xb = xb.to(DEVICE)
-        yb = yb.to(DEVICE)
-        base = base.to(DEVICE)
-        fut = fut.to(DEVICE)
-
-        yhat = model(xb)  # predicted log-return
-        pred_price = base * torch.exp(yhat)
-        actual_price = fut
-
-        abs_err = torch.abs(pred_price - actual_price)
-        abs_errs.append(abs_err.cpu().numpy())
-
-        ape.append((abs_err / torch.clamp(actual_price, min=1e-12)).cpu().numpy())
-
-    abs_errs = np.concatenate(abs_errs) if abs_errs else np.array([])
-    ape = np.concatenate(ape) if ape else np.array([])
-
-    return {
-        "MAE": float(abs_errs.mean()) if abs_errs.size else float("nan"),
-        "MAPE_pct": float(ape.mean() * 100) if ape.size else float("nan"),
-    }
-
-
 def make_target_logret(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     df = df.copy()
     df["y_logret"] = np.log(df["close"].shift(-horizon) / df["close"])
@@ -153,28 +117,87 @@ def make_target_logret(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
     return df
 
 
-def select_feature_cols(df: pd.DataFrame) -> list[str]:
-    # IMPORTANT: these are FUTURE-leaking in your feature_engineering.py
-    # because they are shifted negative (future info).
+def select_feature_cols(df: pd.DataFrame) -> List[str]:
+    # Drop any future-leaking columns from earlier pipelines (shift(-k))
     drop_future = [c for c in df.columns if c.startswith("ret_") or c.startswith("log_ret_")]
     keep = [c for c in df.columns if c not in drop_future and c != "y_logret"]
     return keep
 
 
-def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs: int = 30, batch: int = 64):
+def regression_metrics(pred: np.ndarray, actual: np.ndarray) -> Dict[str, float]:
+    err = pred - actual
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err**2)))
+
+    mape = float(np.mean(np.abs(err) / np.clip(np.abs(actual), 1e-12, None)) * 100)
+    smape = float(np.mean(2 * np.abs(err) / np.clip(np.abs(pred) + np.abs(actual), 1e-12, None)) * 100)
+
+    ss_res = float(np.sum(err**2))
+    ss_tot = float(np.sum((actual - np.mean(actual)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    return {"MAE": mae, "RMSE": rmse, "MAPE_pct": mape, "sMAPE_pct": smape, "R2": r2}
+
+
+def directional_accuracy(pred: np.ndarray, base: np.ndarray, actual: np.ndarray) -> float:
+    pred_dir = (pred > base).astype(int)
+    true_dir = (actual > base).astype(int)
+    return float((pred_dir == true_dir).mean() * 100)
+
+
+@torch.no_grad()
+def eval_price_metrics(model: nn.Module, loader: DataLoader) -> Dict[str, float]:
+    model.eval()
+    pred_prices, act_prices, base_prices = [], [], []
+
+    for xb, _, base, fut in loader:
+        xb = xb.to(DEVICE)
+        base = base.to(DEVICE)
+        fut = fut.to(DEVICE)
+
+        yhat = model(xb)  # predicted log-return
+        pred = base * torch.exp(yhat)
+
+        pred_prices.append(pred.detach().cpu().numpy())
+        act_prices.append(fut.detach().cpu().numpy())
+        base_prices.append(base.detach().cpu().numpy())
+
+    pred_prices = np.concatenate(pred_prices) if pred_prices else np.array([])
+    act_prices = np.concatenate(act_prices) if act_prices else np.array([])
+    base_prices = np.concatenate(base_prices) if base_prices else np.array([])
+
+    if pred_prices.size == 0:
+        return {"MAE": float("nan"), "RMSE": float("nan"), "MAPE_pct": float("nan"), "sMAPE_pct": float("nan"), "R2": float("nan"), "DIR_ACC": float("nan")}
+
+    m = regression_metrics(pred_prices, act_prices)
+    m["DIR_ACC"] = directional_accuracy(pred_prices, base_prices, act_prices)
+    return m
+
+
+def main(
+    timeframe: str = "1h",
+    horizon: int = 4,
+    context_len: int = 48,
+    epochs: int = 30,
+    batch: int = 64,
+    hidden: int = 64,
+    layers: int = 2,
+    dropout: float = 0.3,
+    lr: float = 1e-3,
+):
     feat_path = DATA_DIR / f"xrp_features_{timeframe}.parquet"
     if not feat_path.exists():
         raise FileNotFoundError(f"Missing {feat_path}. Run collector + feature pipeline first.")
 
     df = pd.read_parquet(feat_path).sort_index()
     df = make_target_logret(df, horizon=horizon)
-
     feature_cols = select_feature_cols(df)
 
     # Time split
     n = len(df)
     train_end = int(n * 0.7)
     val_end = int(n * 0.85)
+
     df_train = df.iloc[:train_end].copy()
     df_val = df.iloc[train_end:val_end].copy()
     df_test = df.iloc[val_end:].copy()
@@ -201,8 +224,8 @@ def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs:
     val_loader = DataLoader(val_ds, batch_size=batch, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=batch, shuffle=False)
 
-    model = PriceRegressor(input_dim=len(feature_cols)).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    model = PriceRegressor(input_dim=len(feature_cols), hidden_dim=hidden, num_layers=layers, dropout=dropout).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     loss_fn = nn.SmoothL1Loss()  # Huber
 
     best_val = float("inf")
@@ -233,10 +256,9 @@ def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs:
 
         train_loss = total / max(1, count)
 
-        # validation loss (on y space)
+        # val loss (log-return space)
         model.eval()
-        vtotal = 0.0
-        vcount = 0
+        vtotal, vcount = 0.0, 0
         with torch.no_grad():
             for xb, yb, _, _ in val_loader:
                 xb = xb.to(DEVICE)
@@ -245,11 +267,14 @@ def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs:
                 vloss = loss_fn(yhat, yb)
                 vtotal += float(vloss.item()) * len(yb)
                 vcount += len(yb)
-
         val_loss = vtotal / max(1, vcount)
 
-        metrics = eval_price_metrics(model, val_loader)
-        print(f"Epoch {ep:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f} | val_MAE=${metrics['MAE']:.6f} | val_MAPE={metrics['MAPE_pct']:.2f}%")
+        vm = eval_price_metrics(model, val_loader)
+        print(
+            f"Epoch {ep:03d} | train_loss={train_loss:.5f} | val_loss={val_loss:.5f} | "
+            f"val_MAE=${vm['MAE']:.6f} | val_RMSE=${vm['RMSE']:.6f} | val_MAPE={vm['MAPE_pct']:.2f}% | "
+            f"val_R2={vm['R2']:.4f} | val_DIR_ACC={vm['DIR_ACC']:.2f}%"
+        )
 
         if val_loss < best_val:
             best_val = val_loss
@@ -258,8 +283,28 @@ def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs:
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    test_metrics = eval_price_metrics(model, test_loader)
-    print(f"\nTEST: MAE=${test_metrics['MAE']:.6f} | MAPE={test_metrics['MAPE_pct']:.2f}%")
+    tm = eval_price_metrics(model, test_loader)
+
+    # baseline: no-change future = base
+    # (use test_loader arrays by re-walking once)
+    base_list, fut_list = [], []
+    for _, _, base, fut in test_loader:
+        base_list.append(base.numpy())
+        fut_list.append(fut.numpy())
+    base_np = np.concatenate(base_list)
+    fut_np = np.concatenate(fut_list)
+    baseline_pred = base_np.copy()
+    bm = regression_metrics(baseline_pred, fut_np)
+
+    print("\nTEST METRICS")
+    print(
+        f"MODEL | MAE=${tm['MAE']:.6f} RMSE=${tm['RMSE']:.6f} MAPE={tm['MAPE_pct']:.2f}% "
+        f"sMAPE={tm['sMAPE_pct']:.2f}% R2={tm['R2']:.4f} DIR_ACC={tm['DIR_ACC']:.2f}%"
+    )
+    print(
+        f"BASELINE(no-change) | MAE=${bm['MAE']:.6f} RMSE=${bm['RMSE']:.6f} MAPE={bm['MAPE_pct']:.2f}% "
+        f"sMAPE={bm['sMAPE_pct']:.2f}% R2={bm['R2']:.4f}"
+    )
 
     ckpt_path = MODELS_DIR / f"lstm_price_regressor_{timeframe}_h{horizon}_c{context_len}.pt"
     torch.save(
@@ -271,21 +316,38 @@ def main(timeframe: str = "1h", horizon: int = 4, context_len: int = 48, epochs:
             "horizon": horizon,
             "timeframe": timeframe,
             "target": "y_logret",
-            "test_metrics": test_metrics,
+            "test_metrics": tm,
+            "baseline_metrics": bm,
+            "arch": {"hidden_dim": hidden, "num_layers": layers, "dropout": dropout},
         },
         ckpt_path,
     )
-    print(f"Saved: {ckpt_path}")
+    print(f"\nSaved: {ckpt_path}")
 
 
 if __name__ == "__main__":
     import argparse
+
     p = argparse.ArgumentParser()
     p.add_argument("--timeframe", "-t", default="1h")
     p.add_argument("--horizon", "-H", type=int, default=4)
     p.add_argument("--context", "-c", type=int, default=48)
     p.add_argument("--epochs", "-e", type=int, default=30)
     p.add_argument("--batch", "-b", type=int, default=64)
+    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--layers", type=int, default=2)
+    p.add_argument("--dropout", type=float, default=0.3)
+    p.add_argument("--lr", type=float, default=1e-3)
     args = p.parse_args()
 
-    main(timeframe=args.timeframe, horizon=args.horizon, context_len=args.context, epochs=args.epochs, batch=args.batch)
+    main(
+        timeframe=args.timeframe,
+        horizon=args.horizon,
+        context_len=args.context,
+        epochs=args.epochs,
+        batch=args.batch,
+        hidden=args.hidden,
+        layers=args.layers,
+        dropout=args.dropout,
+        lr=args.lr,
+    )
