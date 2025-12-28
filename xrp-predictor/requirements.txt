@@ -1,0 +1,18 @@
+# Core numeric + data
+numpy
+pandas
+pyarrow
+
+# ML / preprocessing
+torch
+scikit-learn
+
+# Plotting
+matplotlib
+
+# Data sources
+ccxt
+yfinance
+
+# Technical indicators
+pandas_ta

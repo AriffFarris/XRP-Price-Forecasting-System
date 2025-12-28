@@ -1,53 +1,71 @@
 # XRP Price Predictor (Python / PyTorch)
 
-End-to-end XRP forecasting + direction pipeline:
+This repo contains an end-to-end XRP forecasting + direction pipeline.
+
+✅ **Important:** the runnable project lives inside **`xrp-predictor/`**.  
+You should `cd xrp-predictor` before installing dependencies or running any commands.
+
+> ⚠️ Disclaimer: This project is for learning/experimentation and is **not financial advice**.
+
+---
+
+## What’s Inside
+
 - **Price model:** LSTM regressor that predicts **future log-returns**, then converts back to price for evaluation/plots.
 - **Direction model:** LSTM-based **momentum reversal detector** that predicts whether momentum will **continue vs reverse**, then converts that into an UP/DOWN direction call.
-- **Deployment scripts:** quick direction inference, simple trade signal, and a realistic weekly forecast with Monte Carlo uncertainty bands.
-
->  Disclaimer: This project is for learning/experimentation and is **not financial advice**.
+- **Deployment scripts:** quick direction inference, simple trade signal, and a weekly forecast with Monte Carlo uncertainty bands.
 
 ---
 
 ## Repository Structure
 
 ```text
-xrp-predictor/
-  data/
-    collectors/
-      price_collector.py
-    processors/
-      feature_engineering.py
-    processed/
-      xrp_raw_1h.parquet
-      xrp_features_1h.parquet
+XRP-Price-Forecasting-System/
+  README.md
 
-  training/
-    dataset.py
-    train_price_regressor.py
-    train_reversal_detector.py
+  xrp-predictor/
+    .gitignore
+    requirements.txt
 
-  deployment/
-    quick_predict.py
-    inference_reversal.py
-    forecast_week.py
+    data/
+      collectors/
+        price_collector.py
+      processors/
+        feature_engineering.py
+      processed/
+        xrp_raw_1h.parquet
+        xrp_features_1h.parquet
 
-  inference/
-    trade_signal.py
+    training/
+      dataset.py
+      train_price_regressor.py
+      train_reversal_detector.py
 
-  diagnostics/
-    diagnose_reversal_detector.py
-    plot_price_regressor.py
-    graph.py
+    deployment/
+      quick_predict.py
+      inference_reversal.py
+      forecast_week.py
 
-  saved_models/
-    lstm_price_regressor_1h_h4_c48.pt
-    reversal_detector_1h_h4_c48.pt
-    ... (other checkpoints)
+    inference/
+      trade_signal.py
 
-  *.png    # diagnostic + forecast plots
+    diagnostics/
+      diagnose_reversal_detector.py
+      plot_price_regressor.py
+      graph.py
+
+    saved_models/
+      lstm_price_regressor_1h_h4_c48.pt
+      reversal_detector_1h_h4_c48.pt
+      ... (other checkpoints)
+
+    *.png    # diagnostic + forecast plots
 Setup
-1) Create environment
+1) Go to the project folder
+bash
+Copy code
+cd xrp-predictor
+2) Create environment
 bash
 Copy code
 python -m venv .venv
@@ -55,28 +73,10 @@ python -m venv .venv
 .venv\Scripts\activate
 # Mac/Linux:
 # source .venv/bin/activate
-2) Install dependencies
+3) Install dependencies
 bash
 Copy code
 pip install -r requirements.txt
-If you don’t have a requirements.txt yet, you’ll need at least:
-
-torch
-
-pandas, numpy
-
-scikit-learn
-
-matplotlib
-
-ccxt
-
-yfinance
-
-pyarrow
-
-pandas_ta
-
 Data Pipeline
 Step A — Collect OHLCV (Binance via ccxt) + Market Proxy (yfinance)
 Downloads historical candles with pagination and saves:
@@ -205,14 +205,3 @@ This is not a trading system (no slippage, fees, execution logic, or proper risk
 Performance depends on regime and market conditions; direction accuracy can vary over time.
 
 For stronger evaluation: walk-forward validation, feature ablations, and calibration tests.
-
-Next Improvements (Ideas)
-Walk-forward / rolling retraining
-
-Probabilistic forecasting (quantiles) for price model
-
-Feature ablation (which indicators actually help)
-
-Experiment tracking (MLflow / W&B)
-
-CI checks + basic unit tests for the data pipeline
